@@ -135,8 +135,6 @@ function targetUrl(method) {
     url.searchParams.set('convert_action', 'convert_vpreview')
     url.searchParams.set('convert_e', args.experiment)
     url.searchParams.set('convert_v', args.variant)
-  } else if (method === 'eforce') {
-    url.searchParams.set('_conv_eforce', args.force)
   }
   return url.toString()
 }
@@ -159,6 +157,7 @@ async function open(browser, method, options) {
   const context = await browser.newContext(options)
   recordingStarted = Date.now()
   await installGuard(context, aborted)
+  if (method === 'fake') await fakeConvert(context)
   const page = await context.newPage()
   const waitUntil = args.video ? 'domcontentloaded' : 'load'
   const response = await page.goto(targetUrl(method), { waitUntil, timeout: 45000 })
@@ -166,6 +165,12 @@ async function open(browser, method, options) {
   started = Date.now() - 500
   result.status = response ? response.status() : null
   if (result.status === 401) throw new Error('HTTP 401 (basic auth missing)')
+  if (method === 'fake') {
+    await page.evaluate(() =>
+      document.dispatchEvent(new CustomEvent('convert:experiences:updated', { bubbles: true })),
+    )
+    await page.waitForTimeout(500)
+  }
   if (method) {
     const applied = await waitForVariant(page)
     if (!applied) {
@@ -174,6 +179,29 @@ async function open(browser, method, options) {
     }
   }
   return { context, page }
+}
+
+const CONVERT_HOST = /(^|\.)convertexperiments\.com$|^cv\.studyflix\.de$/
+
+// Fakes Convert the way the app's development mode does: the Convert script is not loaded and
+// window.convert reports the forced variant before any page script runs.
+async function fakeConvert(context) {
+  await context.route(
+    (url) => CONVERT_HOST.test(url.hostname),
+    async (route) => {
+      const request = route.request()
+      aborted.push({ method: request.method(), url: request.url(), reason: 'Convert script faked' })
+      console.error(`ABORTED ${request.method()} ${request.url()}: Convert script faked`)
+      await route.abort('blockedbyclient')
+    },
+  )
+  await context.addInitScript(
+    ([experiment, variant]) => {
+      window._conv_q = []
+      window.convert = { currentData: { experiences: { [experiment]: { variation: { id: variant } } } } }
+    },
+    [args.experiment, args.variant],
+  )
 }
 
 function ffmpegPath() {
@@ -215,7 +243,7 @@ try {
 
   let opened
   if (args.force) {
-    for (const method of ['vpreview', 'eforce']) {
+    for (const method of ['vpreview', 'fake']) {
       opened = await open(browser, method, makeOptions())
       if (opened) {
         result.forceApplied = true
