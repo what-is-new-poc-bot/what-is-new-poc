@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Opens a staging page as a role and saves a screenshot or a short video.
 // Usage: node bin/shot.mjs --as <anon|user|academy|admin> --url <path> --out <file>
-//          [--mobile] [--full] [--selector <css>] [--video <seconds>] [--force <experiment id>.<variant id>]
+//          [--mobile] [--full] [--selector <css>] [--video <seconds>] [--actions <file>]
+//          [--force <experiment id>.<variant id>]
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -23,7 +25,7 @@ function parseArgs(argv) {
     const arg = argv[i]
     if (arg === '--mobile') args.mobile = true
     else if (arg === '--full') args.full = true
-    else if (['--as', '--url', '--out', '--selector', '--video', '--force'].includes(arg)) args[arg.slice(2)] = argv[++i]
+    else if (['--as', '--url', '--out', '--selector', '--video', '--actions', '--force'].includes(arg)) args[arg.slice(2)] = argv[++i]
     else throw new Error(`Unknown argument ${arg}`)
   }
   if (!args.as || !args.url || !args.out) throw new Error('--as, --url and --out are required')
@@ -33,6 +35,7 @@ function parseArgs(argv) {
     if (!(seconds > 0)) throw new Error('--video needs a positive number of seconds')
     args.video = Math.min(seconds, 10)
   }
+  if (args.actions !== undefined) args.steps = loadSteps(args.actions)
   if (args.force !== undefined) {
     const match = /^([^.]+)\.([^.]+)$/.exec(args.force)
     if (!match) throw new Error('--force needs <experiment id>.<variant id>')
@@ -40,6 +43,52 @@ function parseArgs(argv) {
     args.variant = match[2]
   }
   return args
+}
+
+const STEP_KINDS = ['click', 'hover', 'type', 'press', 'scroll', 'wait', 'waitFor']
+
+function loadSteps(file) {
+  const steps = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (!Array.isArray(steps)) throw new Error('--actions file must contain a JSON list of steps')
+  for (const step of steps) {
+    const keys = step && typeof step === 'object' ? Object.keys(step) : []
+    if (keys.length !== 1 || !STEP_KINDS.includes(keys[0])) throw new Error(`Invalid action step ${JSON.stringify(step)}`)
+    if (keys[0] === 'type' && !(Array.isArray(step.type) && step.type.length === 2)) {
+      throw new Error('A type step needs ["<css>", "<text>"]')
+    }
+  }
+  return steps
+}
+
+async function runStep(page, step) {
+  const [kind] = Object.keys(step)
+  const value = step[kind]
+  const timeout = 5000
+  if (kind === 'click') await page.locator(value).first().click({ timeout })
+  else if (kind === 'hover') await page.locator(value).first().hover({ timeout })
+  else if (kind === 'type') await page.locator(value[0]).first().pressSequentially(String(value[1]), { delay: 60, timeout })
+  else if (kind === 'press') await page.keyboard.press(value)
+  else if (kind === 'scroll') await page.mouse.wheel(0, Number(value))
+  else if (kind === 'wait') await page.waitForTimeout(Math.min(Number(value), 10000))
+  else if (kind === 'waitFor') await page.locator(value).first().waitFor({ state: 'visible', timeout })
+  if (kind === 'scroll') await page.waitForTimeout(400)
+}
+
+// Runs the steps in order and stops at the first one that fails.
+async function runSteps(page, steps) {
+  for (const [index, step] of steps.entries()) {
+    console.error(`STEP ${index + 1} ${JSON.stringify(step)}`)
+    try {
+      if (args.video && videoLeft() <= 0) throw new Error(`video limit of ${args.video} s reached`)
+      await runStep(page, step)
+      result.actions.push(step)
+    } catch (error) {
+      result.actionError = `step ${index + 1} ${JSON.stringify(step)}: ${String(error.message || error).split('\n')[0]}`
+      console.error(`STEP ${index + 1} failed`)
+      return false
+    }
+  }
+  return true
 }
 
 let args
@@ -60,6 +109,8 @@ const result = {
   forced: args.force || null,
   forceApplied: null,
   forceMethod: null,
+  actions: [],
+  actionError: null,
   experiments: [],
   aborted,
 }
@@ -106,9 +157,13 @@ async function waitForVariant(page) {
 // and returns null when a forced variant did not become active.
 async function open(browser, method, options) {
   const context = await browser.newContext(options)
+  recordingStarted = Date.now()
   await installGuard(context, aborted)
   const page = await context.newPage()
-  const response = await page.goto(targetUrl(method), { waitUntil: 'load', timeout: 45000 })
+  const waitUntil = args.video ? 'domcontentloaded' : 'load'
+  const response = await page.goto(targetUrl(method), { waitUntil, timeout: 45000 })
+  // The video's 10 s start shortly before the page is first shown; earlier frames are cut off.
+  started = Date.now() - 500
   result.status = response ? response.status() : null
   if (result.status === 401) throw new Error('HTTP 401 (basic auth missing)')
   if (method) {
@@ -121,11 +176,32 @@ async function open(browser, method, options) {
   return { context, page }
 }
 
+function ffmpegPath() {
+  const root = process.env.PLAYWRIGHT_BROWSERS_PATH || '/opt/pw-browsers'
+  for (const dir of fs.existsSync(root) ? fs.readdirSync(root).filter((d) => d.startsWith('ffmpeg')) : []) {
+    const candidate = path.join(root, dir, 'ffmpeg-linux')
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return 'ffmpeg'
+}
+
+// Cuts the recording to at most `seconds`, starting at `offset` seconds.
+function trimVideo(source, target, offset, seconds) {
+  execFileSync(
+    ffmpegPath(),
+    ['-y', '-loglevel', 'error', '-ss', offset.toFixed(2), '-i', source, '-t', String(seconds), '-an',
+      '-c:v', 'libvpx', '-b:v', '2M', '-deadline', 'realtime', target],
+    { stdio: ['ignore', 'ignore', 'pipe'] },
+  )
+}
+
 let exitCode = 0
+let started = Date.now()
+let recordingStarted = Date.now()
+const videoLeft = () => args.video * 1000 - (Date.now() - started)
 const browser = await launchBrowser()
 const videoDirs = []
 try {
-  const started = Date.now()
   const makeOptions = () => {
     const options = contextOptions()
     if (args.video) {
@@ -156,10 +232,19 @@ try {
   }
   const { context, page } = opened
 
-  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {})
+  // A video has at most 10 s, so it waits less for the network to settle.
+  await page.waitForLoadState('networkidle', { timeout: args.video ? 1500 : 8000 }).catch(() => {})
   result.consent = await grantConsent(page)
-  await slowScroll(page)
-  await page.waitForTimeout(500)
+  // In a video with steps, the recording time goes to the steps instead of the scroll.
+  if (!(args.video && args.steps)) {
+    await slowScroll(page)
+    await page.waitForTimeout(500)
+  }
+  let stepsOk = true
+  if (args.steps) {
+    stepsOk = await runSteps(page, args.steps)
+    if (args.video && stepsOk) await page.waitForTimeout(Math.max(0, Math.min(2000, videoLeft())))
+  }
   result.finalUrl = page.url()
   result.experiments = await page.evaluate(() =>
     Array.from(document.documentElement.attributes)
@@ -169,12 +254,13 @@ try {
 
   fs.mkdirSync(path.dirname(result.file), { recursive: true })
   if (args.video) {
-    const remaining = args.video * 1000 - (Date.now() - started)
-    if (remaining > 0) await page.waitForTimeout(remaining)
+    if (!args.steps && videoLeft() > 0) await page.waitForTimeout(videoLeft())
     const video = page.video()
     await context.close()
     const target = result.file.endsWith('.webm') ? result.file : `${result.file}.webm`
-    await video.saveAs(target)
+    const raw = path.join(videoDirs[videoDirs.length - 1], 'raw.webm')
+    await video.saveAs(raw)
+    trimVideo(raw, target, Math.max(0, (started - recordingStarted) / 1000), args.video)
     result.file = target
   } else {
     if (args.selector) {
@@ -188,6 +274,7 @@ try {
     await context.close()
   }
   if (result.status && result.status >= 400) exitCode = 1
+  if (!stepsOk) exitCode = 1
 } catch (error) {
   result.error = String(error && error.message ? error.message : error).split('\n')[0]
   exitCode = 1
