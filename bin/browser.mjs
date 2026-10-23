@@ -103,18 +103,36 @@ export function absoluteUrl(target) {
   return BASE_URL + (target.startsWith('/') ? target : `/${target}`)
 }
 
-// Grants consent if Didomi shows up within the timeout. Returns true when consent was granted.
+const DIDOMI_OVERLAY = '#didomi-host, #didomi-popup, .didomi-popup-open'
+
+// Grants consent if Didomi shows up within the timeout. setUserAgreeToAll alone leaves the notice
+// open and the page blurred, so the agree button is clicked as well and the overlay waited out.
+// Returns true when consent was granted.
 export async function grantConsent(page, timeout = 5000) {
   try {
     await page.waitForFunction(() => window.Didomi && typeof window.Didomi.setUserAgreeToAll === 'function', null, {
       timeout,
     })
     await page.evaluate(() => window.Didomi.setUserAgreeToAll())
-    await page.waitForTimeout(500)
-    return true
   } catch {
     return false
   }
+  const button = page.locator('#didomi-notice-agree-button')
+  if (await button.isVisible().catch(() => false)) await button.click({ timeout: 3000 }).catch(() => {})
+  await page
+    .waitForFunction(
+      (selector) =>
+        Array.from(document.querySelectorAll(selector)).every((el) => {
+          const style = getComputedStyle(el)
+          const box = el.getBoundingClientRect()
+          return style.display === 'none' || style.visibility === 'hidden' || box.width === 0 || box.height === 0
+        }),
+      DIDOMI_OVERLAY,
+      { timeout: 5000 },
+    )
+    .catch(() => {})
+  await page.waitForTimeout(300)
+  return true
 }
 
 export async function slowScroll(page) {

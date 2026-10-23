@@ -2,7 +2,7 @@
 // Opens a staging page as a role and saves a screenshot or a short video.
 // Usage: node bin/shot.mjs --as <anon|user|academy|admin> --url <path> --out <file>
 //          [--mobile] [--full] [--selector <css>] [--video <seconds>] [--actions <file>]
-//          [--force <experiment id>.<variant id>]
+//          [--poll-for <css>] [--force <experiment id>.<variant id>]
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -25,7 +25,7 @@ function parseArgs(argv) {
     const arg = argv[i]
     if (arg === '--mobile') args.mobile = true
     else if (arg === '--full') args.full = true
-    else if (['--as', '--url', '--out', '--selector', '--video', '--actions', '--force'].includes(arg)) args[arg.slice(2)] = argv[++i]
+    else if (['--as', '--url', '--out', '--selector', '--video', '--actions', '--poll-for', '--force'].includes(arg)) args[arg.slice(2).replace('-for', 'For')] = argv[++i]
     else throw new Error(`Unknown argument ${arg}`)
   }
   if (!args.as || !args.url || !args.out) throw new Error('--as, --url and --out are required')
@@ -111,6 +111,7 @@ const result = {
   forceMethod: null,
   actions: [],
   actionError: null,
+  polled: args.pollFor ? { selector: args.pollFor, appeared: false, afterMs: null } : null,
   experiments: [],
   aborted,
 }
@@ -226,7 +227,22 @@ function trimVideo(source, target, offset, seconds) {
 let exitCode = 0
 let started = Date.now()
 let recordingStarted = Date.now()
+let videoEnd = null
 const videoLeft = () => args.video * 1000 - (Date.now() - started)
+
+// Waits up to 30 s for the polled element to become visible.
+async function pollFor(page) {
+  const since = Date.now()
+  const appeared = await page
+    .locator(args.pollFor)
+    .first()
+    .waitFor({ state: 'visible', timeout: 30000 })
+    .then(() => true)
+    .catch(() => false)
+  result.polled.appeared = appeared
+  if (appeared) result.polled.afterMs = Date.now() - since
+  return appeared
+}
 const browser = await launchBrowser()
 const videoDirs = []
 try {
@@ -263,15 +279,25 @@ try {
   // A video has at most 10 s, so it waits less for the network to settle.
   await page.waitForLoadState('networkidle', { timeout: args.video ? 1500 : 8000 }).catch(() => {})
   result.consent = await grantConsent(page)
-  // In a video with steps, the recording time goes to the steps instead of the scroll.
-  if (!(args.video && args.steps)) {
+  // In a video with steps, the recording time goes to the steps instead of the scroll; a polled
+  // element must be caught the moment it shows up.
+  if (!(args.video && args.steps) && !args.pollFor) {
     await slowScroll(page)
     await page.waitForTimeout(500)
   }
   let stepsOk = true
   if (args.steps) {
     stepsOk = await runSteps(page, args.steps)
-    if (args.video && stepsOk) await page.waitForTimeout(Math.max(0, Math.min(2000, videoLeft())))
+    if (args.video && stepsOk && !args.pollFor) await page.waitForTimeout(Math.max(0, Math.min(2000, videoLeft())))
+  }
+  if (args.pollFor && stepsOk) {
+    const appeared = await pollFor(page)
+    // With a video, the recording runs from load until 3 s after the element appears and keeps
+    // the last seconds up to the video limit.
+    if (args.video) {
+      await page.waitForTimeout(appeared ? 3000 : 0)
+      videoEnd = Date.now()
+    }
   }
   result.finalUrl = page.url()
   result.experiments = await page.evaluate(() =>
@@ -282,13 +308,15 @@ try {
 
   fs.mkdirSync(path.dirname(result.file), { recursive: true })
   if (args.video) {
-    if (!args.steps && videoLeft() > 0) await page.waitForTimeout(videoLeft())
+    if (!args.steps && !args.pollFor && videoLeft() > 0) await page.waitForTimeout(videoLeft())
     const video = page.video()
     await context.close()
     const target = result.file.endsWith('.webm') ? result.file : `${result.file}.webm`
     const raw = path.join(videoDirs[videoDirs.length - 1], 'raw.webm')
     await video.saveAs(raw)
-    trimVideo(raw, target, Math.max(0, (started - recordingStarted) / 1000), args.video)
+    const from = videoEnd ? Math.max(started, videoEnd - args.video * 1000) : started
+    const length = videoEnd ? Math.min(args.video, (videoEnd - from) / 1000) : args.video
+    trimVideo(raw, target, Math.max(0, (from - recordingStarted) / 1000), Number(length.toFixed(2)))
     result.file = target
   } else {
     if (args.selector) {
